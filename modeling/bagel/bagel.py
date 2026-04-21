@@ -178,7 +178,14 @@ class Bagel(PreTrainedModel):
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
-        if self.config.visual_gen:
+        has_vae_batch = (
+            self.config.visual_gen
+            and padded_latent is not None
+            and patchified_vae_latent_shapes is not None
+            and len(patchified_vae_latent_shapes) > 0
+        )
+        if has_vae_batch:
+            # Guard for packed batches with only text samples (no VAE images).
             p = self.latent_patch_size
             packed_latent = []
             for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
@@ -215,7 +222,7 @@ class Bagel(PreTrainedModel):
         )
 
         mse = None
-        if self.config.visual_gen:
+        if has_vae_batch:
             packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
             target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
             has_mse = packed_timesteps > 0

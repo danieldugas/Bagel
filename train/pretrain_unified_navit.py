@@ -646,7 +646,7 @@ def main():
         pin_memory=True,
         collate_fn=collate_wrapper(),
         drop_last=True,
-        prefetch_factor=data_args.prefetch_factor,
+        prefetch_factor=data_args.prefetch_factor if data_args.num_workers > 0 else None,
     )
 
     # Prepare models for training:
@@ -680,8 +680,14 @@ def main():
             dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
             seqlen_square_window += sample_square.item()
 
+        print(
+            f"[diag] rank={dist.get_rank()} step={curr_step} "
+            f"micro={micro_step} data_indexes={data_indexes}",
+            flush=True,
+        )
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            if training_args.visual_gen:
+            if training_args.visual_gen and 'padded_images' in data:
+                # Guard for packed batches with only text samples (no VAE images).
                 with torch.no_grad():
                     data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
             try:
@@ -713,11 +719,16 @@ def main():
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
-            total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
+            # all_reduce runs on every rank even when this rank had no VAE
+            # samples, so NCCL stays in lockstep across the pack group.
+            total_mse_tokens = torch.tensor(len(data.get('mse_loss_indexes', [])), device=device)
             dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
-            mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
-            loss_dict["mse"] = mse.detach()
-            loss = loss + mse * training_args.mse_weight
+            if mse is not None and total_mse_tokens.item() > 0:
+                mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
+                loss_dict["mse"] = mse.detach()
+                loss = loss + mse * training_args.mse_weight
+            else:
+                loss_dict["mse"] = torch.tensor(0.0, device=device)
         else:
             assert not training_args.visual_gen
             loss_dict["mse"] = torch.tensor(0, device=device)
