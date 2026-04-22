@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import functools
 import gc
 import os
@@ -22,6 +23,25 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from safetensors.torch import load_file, save_file
+
+@contextlib.contextmanager
+def _state_dict_type(module, st_type, state_dict_config=None, optim_state_dict_config=None):
+    # Replacement for `FSDP.state_dict_type(...)` as a context manager.
+    # The upstream context manager exit restores the previous state_dict_type,
+    # which is `None` on first entry, triggering `KeyError: None` in
+    # `set_state_dict_type` on some torch versions. We explicitly set the type
+    # on enter and reset to FULL_STATE_DICT (the library default) on exit.
+    kwargs = {}
+    if state_dict_config is not None:
+        kwargs["state_dict_config"] = state_dict_config
+    if optim_state_dict_config is not None:
+        kwargs["optim_state_dict_config"] = optim_state_dict_config
+    FSDP.set_state_dict_type(module, st_type, **kwargs)
+    try:
+        yield
+    finally:
+        FSDP.set_state_dict_type(module, StateDictType.FULL_STATE_DICT)
+
 
 from modeling.bagel.modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from modeling.bagel.qwen2_navit import (
@@ -111,19 +131,19 @@ class FSDPCheckpoint:
         sharded_cfg = ShardedStateDictConfig(offload_to_cpu=False)
 
         if ema_model is not None:
-            with FSDP.state_dict_type(ema_model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+            with _state_dict_type(ema_model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
                 ema_state_dict = ema_model.state_dict()
                 dcp.save(ema_state_dict, checkpoint_id=os.path.join(save_path, "ema"))
                 del ema_state_dict
                 gc.collect()
 
-        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+        with _state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
             model_state_dict = model.state_dict()
             dcp.save(model_state_dict, checkpoint_id=os.path.join(save_path, "model"))
             del model_state_dict
             gc.collect()
 
-        with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
+        with _state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
             if fsdp_config.sharding_strategy == "FULL_SHARD":
                 shard_index = dist.get_rank()
                 total_shards = dist.get_world_size()
@@ -195,7 +215,7 @@ class FSDPCheckpoint:
         # FSDP-wrapped model in-place, popping fixed sinusoidal pos embeds so
         # the checkpoint can be reused at different resolutions.
         sharded_cfg = ShardedStateDictConfig(offload_to_cpu=False)
-        with FSDP.state_dict_type(fsdp_model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
+        with _state_dict_type(fsdp_model, StateDictType.SHARDED_STATE_DICT, sharded_cfg):
             state_dict = fsdp_model.state_dict()
             state_dict.pop('latent_pos_embed.pos_embed', None)
             state_dict.pop('vit_pos_embed.pos_embed', None)
