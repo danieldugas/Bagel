@@ -680,8 +680,10 @@ def main():
             dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
             seqlen_square_window += sample_square.item()
 
+        from datetime import datetime
+        _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(
-            f"[diag] rank={dist.get_rank()} step={curr_step} "
+            f"[diag {_ts}] rank={dist.get_rank()} step={curr_step} "
             f"micro={micro_step} data_indexes={data_indexes}",
             flush=True,
         )
@@ -700,13 +702,22 @@ def main():
         
         loss = 0
         ce = loss_dict["ce"]
+        # Collectives must run on every rank every step, even when this rank's
+        # pack has no CE samples — otherwise ranks diverge on the NCCL seq and
+        # the next scalar allreduce hangs (see slurm-986.err).
+        total_ce_tokens = torch.tensor(
+            len(data['ce_loss_indexes']) if ce is not None else 0, device=device,
+        )
+        dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
+        if training_args.ce_loss_reweighting:
+            total_ce_loss_weights = (
+                ce_loss_weights.sum() if ce is not None
+                else torch.tensor(0.0, device=device)
+            )
+            dist.all_reduce(total_ce_loss_weights, op=dist.ReduceOp.SUM)
         if ce is not None:
-            total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
-            dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
             if training_args.ce_loss_reweighting:
                 ce = ce * ce_loss_weights
-                total_ce_loss_weights = ce_loss_weights.sum()
-                dist.all_reduce(total_ce_loss_weights, op=dist.ReduceOp.SUM)
                 ce = ce.sum() * dist.get_world_size() / total_ce_loss_weights
             else:
                 ce = ce.sum() * dist.get_world_size() / total_ce_tokens
@@ -715,7 +726,6 @@ def main():
         else:
             assert not training_args.visual_und
             loss_dict["ce"] = torch.tensor(0, device=device)
-            total_ce_tokens = torch.tensor(0, device=device)
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
