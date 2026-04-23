@@ -687,6 +687,21 @@ def main():
             f"micro={micro_step} data_indexes={data_indexes}",
             flush=True,
         )
+        if training_args.visual_gen and 'padded_images' not in data:
+            # Observability for the rank-divergent forward path: the
+            # `has_vae_batch` branch in Bagel.forward (bagel.py:187) is
+            # skipped when this rank's pack has no VAE samples. While the
+            # FSDP-wrapping fix (TimestepEmbedder/PositionEmbedding removed
+            # from transformer_layer_cls in fsdp_utils.py) eliminates the
+            # unshard-divergence deadlock from slurm-1007.err, this warning
+            # still flags imbalanced packs — useful for debugging and for
+            # catching any future code added to the branch that would
+            # re-introduce rank divergence.
+            print(
+                f"[warn {_ts}] rank={dist.get_rank()} step={curr_step}: "
+                f"pack has no VAE samples (has_vae_batch=False).",
+                flush=True,
+            )
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
             if training_args.visual_gen and 'padded_images' in data:
                 # Guard for packed batches with only text samples (no VAE images).
@@ -705,10 +720,21 @@ def main():
         # Collectives must run on every rank every step, even when this rank's
         # pack has no CE samples — otherwise ranks diverge on the NCCL seq and
         # the next scalar allreduce hangs (see slurm-986.err).
+        print(
+            f"[diag {_ts}] rank={dist.get_rank()} step={curr_step} "
+            f"ce_branch={'present' if ce is not None else 'absent'} "
+            f"before_ce_allreduce",
+            flush=True,
+        )
         total_ce_tokens = torch.tensor(
             len(data['ce_loss_indexes']) if ce is not None else 0, device=device,
         )
         dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
+        print(
+            f"[diag {_ts}] rank={dist.get_rank()} step={curr_step} "
+            f"after_ce_allreduce ce_tokens={total_ce_tokens.item()}",
+            flush=True,
+        )
         if training_args.ce_loss_reweighting:
             total_ce_loss_weights = (
                 ce_loss_weights.sum() if ce is not None
@@ -739,10 +765,28 @@ def main():
                 loss = loss + mse * training_args.mse_weight
             else:
                 loss_dict["mse"] = torch.tensor(0.0, device=device)
+            # Keep autograd traversing the dummy VAE branch in bagel.py so
+            # time_embedder / vae2llm FSDP reduce-scatter hooks fire on
+            # ranks with no VAE samples (see bagel.py:205 comment and
+            # slurm-1007.err). Contributes 0 to the loss. Pop out of
+            # loss_dict so the logging loop below doesn't try to .item()
+            # a None (slurm-1027.err).
+            vae_branch_dummy = loss_dict.pop("vae_branch_dummy", None)
+            if vae_branch_dummy is not None:
+                # Scale by a tiny *tensor* rather than the Python literal
+                # 0.0: autograd may simplify `0.0 * x` out of the graph
+                # on some PyTorch versions, which defeats the whole
+                # point — time_embedder's reduce-scatter would then not
+                # fire. A tensor multiplier forces the mul op to be a
+                # real autograd node. The 1e-30 magnitude contributes
+                # nothing numerically to the loss or to gradients.
+                _dummy_weight = torch.tensor(1e-30, device=device, dtype=vae_branch_dummy.dtype)
+                loss = loss + _dummy_weight * vae_branch_dummy
         else:
             assert not training_args.visual_gen
             loss_dict["mse"] = torch.tensor(0, device=device)
             total_mse_tokens = torch.tensor(0, device=device)
+            loss_dict.pop("vae_branch_dummy", None)
 
         loss = loss / training_args.gradient_accumulation_steps
         loss.backward()

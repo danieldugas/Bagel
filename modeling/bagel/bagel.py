@@ -202,6 +202,43 @@ class Bagel(PreTrainedModel):
             latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
             packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
             packed_sequence[packed_vae_token_indexes] = packed_latent
+        vae_branch_dummy = None
+        if (not has_vae_batch) and self.config.visual_gen:
+            # time_embedder and latent_pos_embed are each their own FSDP
+            # unit (see fsdp_utils.py transformer_layer_cls). When
+            # visual_gen is enabled but this rank's pack has no VAE
+            # samples, skipping their call leaves their FSDP all_gather
+            # unfired on this rank while ranks with VAE samples do fire it
+            # — causing mesh_shard NCCL seq divergence and deadlock with
+            # the next default_pg allreduce (see slurm-1007.err: ranks
+            # 0/1/2 stuck on _ALLGATHER_BASE mesh_shard while rank 3
+            # races to CE allreduce).
+            #
+            # Call each on a 1-element input so the forward all_gather
+            # fires on every rank. Use size-1 (not size-0) to sidestep
+            # potential activation-checkpointing / saved-tensor edge
+            # cases with zero-length tensors. vae2llm is a plain Linear
+            # absorbed into the root FSDP unit; call it too for symmetry
+            # but mainly so its params take part in the dummy backward
+            # path below.
+            #
+            # time_embedder has trainable params in its own FSDP unit, so
+            # its *backward* reduce-scatter must also fire on every rank.
+            # Expose a scalar `vae_branch_dummy` derived from its output
+            # so the trainer can add `tiny_weight * vae_branch_dummy` to
+            # the loss, forcing autograd to traverse these modules. The
+            # trainer scales by 1e-30 (not 0.0) to prevent autograd from
+            # pruning the mul op on some PyTorch versions.
+            _device = packed_sequence.device
+            _dtype = packed_sequence.dtype
+            _ts = torch.zeros(1, dtype=_dtype, device=_device)
+            _pos = torch.zeros(1, dtype=torch.long, device=_device)
+            _patch_flat = self.latent_patch_size * self.latent_patch_size * self.latent_channel
+            _latent = torch.zeros(1, _patch_flat, dtype=_dtype, device=_device)
+            _te = self.time_embedder(_ts)
+            _lp = self.latent_pos_embed(_pos)  # frozen, no grad
+            _vl = self.vae2llm(_latent)
+            vae_branch_dummy = _te.sum() + _vl.sum() + _lp.sum()
 
         extra_inputs = {}
         if self.use_moe:
@@ -233,7 +270,7 @@ class Bagel(PreTrainedModel):
             packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
-        return dict(mse=mse, ce=ce)
+        return dict(mse=mse, ce=ce, vae_branch_dummy=vae_branch_dummy)
 
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
