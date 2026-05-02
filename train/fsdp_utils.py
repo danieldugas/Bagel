@@ -225,6 +225,13 @@ class FSDPCheckpoint:
             gc.collect()
 
     @staticmethod
+    def _load_full_state_dict(model, state_dict, strict=False):
+        if isinstance(model, FSDP):
+            with _state_dict_type(model, StateDictType.FULL_STATE_DICT):
+                return model.load_state_dict(state_dict, strict=strict)
+        return model.load_state_dict(state_dict, strict=strict)
+
+    @staticmethod
     def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False):
         if resume_from is None or not os.path.exists(resume_from):
             logger.info(f"Training from scratch.")
@@ -252,9 +259,9 @@ class FSDPCheckpoint:
         model_state_dict = load_file(model_state_dict_path, device="cpu")
         # NOTE position embeds are fixed sinusoidal embeddings, so we can just pop it off,
         # which makes it easier to adapt to different resolutions.
-        model_state_dict.pop('latent_pos_embed.pos_embed')
-        model_state_dict.pop('vit_pos_embed.pos_embed')
-        msg = model.load_state_dict(model_state_dict, strict=False)
+        model_state_dict.pop('latent_pos_embed.pos_embed', None)
+        model_state_dict.pop('vit_pos_embed.pos_embed', None)
+        msg = FSDPCheckpoint._load_full_state_dict(model, model_state_dict, strict=False)
         logger.info(msg)
         del model_state_dict
 
@@ -264,13 +271,34 @@ class FSDPCheckpoint:
                 logger.info(f"replicaing ema model from {model_state_dict_path}.")
                 ema_state_dict_path = model_state_dict_path
             ema_state_dict = load_file(ema_state_dict_path, device="cpu")
-            ema_state_dict.pop('latent_pos_embed.pos_embed')
-            ema_state_dict.pop('vit_pos_embed.pos_embed')
-            msg = ema_model.load_state_dict(ema_state_dict, strict=False)
+            ema_state_dict.pop('latent_pos_embed.pos_embed', None)
+            ema_state_dict.pop('vit_pos_embed.pos_embed', None)
+            msg = FSDPCheckpoint._load_full_state_dict(ema_model, ema_state_dict, strict=False)
             logger.info(msg)
             del ema_state_dict
 
         return model, ema_model
+
+    @staticmethod
+    def has_compatible_train_state(resume_from, fsdp_config):
+        if resume_from is None or not os.path.exists(resume_from):
+            return False
+        if fsdp_config.sharding_strategy == "FULL_SHARD":
+            total_shards = dist.get_world_size()
+        elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            total_shards = fsdp_config.num_shard
+        else:
+            raise NotImplementedError
+
+        if not os.path.exists(os.path.join(resume_from, "scheduler.pt")):
+            return False
+        for shard_index in range(total_shards):
+            optimizer_state_dict_path = os.path.join(
+                resume_from, f"optimizer.{shard_index:05d}-of-{total_shards:05d}.pt"
+            )
+            if not os.path.exists(optimizer_state_dict_path):
+                return False
+        return True
 
     @staticmethod
     def try_load_train_state(resume_from, optimizer, scheduler, fsdp_config):

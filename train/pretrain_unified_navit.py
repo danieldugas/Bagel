@@ -95,6 +95,44 @@ def detect_peak_tflops(default_tflops: float) -> float:
     return tflops
 
 
+def build_bagel_model(model_args, training_args, llm_config, vit_config, vae_config):
+    if training_args.finetune_from_hf:
+        language_model = Qwen2ForCausalLM(deepcopy(llm_config))
+    else:
+        language_model = Qwen2ForCausalLM.from_pretrained(
+            model_args.llm_path, config=deepcopy(llm_config)
+        )
+    if training_args.copy_init_moe:
+        language_model.init_moe()
+
+    vit_model = None
+    if training_args.visual_und:
+        if training_args.finetune_from_hf:
+            vit_model = SiglipVisionModel(deepcopy(vit_config))
+        else:
+            vit_model = SiglipVisionModel.from_pretrained(
+                model_args.vit_path, config=deepcopy(vit_config)
+            )
+
+    config = BagelConfig(
+        visual_gen=training_args.visual_gen,
+        visual_und=training_args.visual_und,
+        llm_config=deepcopy(llm_config),
+        vit_config=deepcopy(vit_config) if training_args.visual_und else None,
+        vae_config=vae_config if training_args.visual_gen else None,
+        latent_patch_size=model_args.latent_patch_size,
+        max_latent_size=model_args.max_latent_size,
+        vit_max_num_patch_per_side=model_args.vit_max_num_patch_per_side,
+        connector_act=model_args.connector_act,
+        interpolate_pos=model_args.interpolate_pos,
+        timestep_shift=training_args.timestep_shift,
+    )
+    model = Bagel(language_model, vit_model, config)
+    if training_args.visual_und:
+        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
+    return model
+
+
 @dataclass
 class ModelArguments:
     model_path: str = field(
@@ -469,7 +507,7 @@ def main():
     seed = training_args.global_seed * dist.get_world_size() + dist.get_rank()
     set_seed(seed)
 
-    # Setup model:
+    # Setup model configs:
     if training_args.finetune_from_hf:
         llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json"))
     else:
@@ -478,13 +516,8 @@ def main():
     llm_config.qk_norm = model_args.llm_qk_norm
     llm_config.tie_word_embeddings = model_args.tie_word_embeddings
     llm_config.freeze_und = training_args.freeze_und
-    if training_args.finetune_from_hf:
-        language_model = Qwen2ForCausalLM(llm_config)
-    else:
-        language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
-    if training_args.copy_init_moe:
-        language_model.init_moe()
 
+    vit_config = None
     if training_args.visual_und:  
         if training_args.finetune_from_hf:
             vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
@@ -492,38 +525,16 @@ def main():
             vit_config = SiglipVisionConfig.from_pretrained(model_args.vit_path)
         vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
         vit_config.rope = model_args.vit_rope
-        if training_args.finetune_from_hf:
-            vit_model = SiglipVisionModel(vit_config)
-        else:
-            vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
 
+    vae_model = None
+    vae_config = None
     if training_args.visual_gen:
         vae_model, vae_config = load_ae(
             local_path=os.path.join(model_args.model_path, "ae.safetensors") 
             if training_args.finetune_from_hf else model_args.vae_path
         )
 
-    config = BagelConfig(
-        visual_gen=training_args.visual_gen,
-        visual_und=training_args.visual_und,
-        llm_config=llm_config, 
-        vit_config=vit_config if training_args.visual_und else None,
-        vae_config=vae_config if training_args.visual_gen else None,
-        latent_patch_size=model_args.latent_patch_size,
-        max_latent_size=model_args.max_latent_size,
-        vit_max_num_patch_per_side=model_args.vit_max_num_patch_per_side,
-        connector_act=model_args.connector_act,
-        interpolate_pos=model_args.interpolate_pos,
-        timestep_shift=training_args.timestep_shift,
-    )
-    model = Bagel(
-        language_model, 
-        vit_model if training_args.visual_und else None, 
-        config
-    )
-
-    if training_args.visual_und:
-        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
+    model = build_bagel_model(model_args, training_args, llm_config, vit_config, vae_config)
 
     total_param_count = count_parameters(model)
     lm_param_count = count_parameters(model.language_model)
@@ -534,6 +545,7 @@ def main():
     tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
+        llm_config.vocab_size = len(tokenizer)
         model.config.llm_config.vocab_size = len(tokenizer)
         model.language_model.config.vocab_size = len(tokenizer)
 
@@ -558,12 +570,22 @@ def main():
         num_replicate=training_args.num_replicate,
         num_shard=training_args.num_shard,
     )
-    ema_model = deepcopy(model)
-    model, ema_model = FSDPCheckpoint.try_load_ckpt(
-        resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
-    )
-    ema_model = fsdp_ema_setup(ema_model, fsdp_config)
     fsdp_model = fsdp_wrapper(model, fsdp_config)
+    del model
+    gc.collect()
+
+    # Build the EMA copy only after the training model has been sharded. This
+    # avoids briefly holding two full 14B-parameter CPU models on every rank.
+    ema_model = build_bagel_model(model_args, training_args, llm_config, vit_config, vae_config)
+    ema_model = fsdp_ema_setup(ema_model, fsdp_config)
+
+    loaded_weights = resume_from is not None and os.path.exists(resume_from)
+    fsdp_model, ema_model = FSDPCheckpoint.try_load_ckpt(
+        resume_from, logger, fsdp_model, ema_model, resume_from_ema=finetune_from_ema
+    )
+    if not loaded_weights:
+        fsdp_ema_update(ema_model, fsdp_model, decay=0.0)
+
     apply_activation_checkpointing(
         fsdp_model, 
         checkpoint_wrapper_fn=functools.partial(
@@ -574,7 +596,7 @@ def main():
 
     if dist.get_rank() == 0:
         print(fsdp_model)
-        for name, param in model.named_parameters():
+        for name, param in fsdp_model.named_parameters():
             print(name, param.requires_grad)
 
     # Setup optimizer and scheduler
@@ -601,6 +623,14 @@ def main():
 
     # maybe resume optimizer, scheduler, and train_steps
     if resume_model_only:
+        train_step = 0
+        data_status = None
+    elif not FSDPCheckpoint.has_compatible_train_state(resume_from, fsdp_config):
+        logger.warning(
+            f"Checkpoint at {resume_from} does not have optimizer/scheduler "
+            f"state compatible with num_shard={fsdp_config.num_shard}; "
+            "loaded model weights only and restarted optimizer state."
+        )
         train_step = 0
         data_status = None
     else:
@@ -662,7 +692,7 @@ def main():
     total_norm = torch.tensor(0.0, device=device)
     token_window = 0.0
     seqlen_square_window = 0.0
-    dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
+    dense_token_factor, attn_factor = qwen2_flop_coefficients(llm_config)
     for micro_step, data in enumerate(train_loader):
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
